@@ -16,10 +16,19 @@ FROM python:3.12-slim-bookworm
 # libgl1/libglib2.0-0: opencv-python (a faiss/pandas/pillow transitive
 # dependency chain can pull it in) needs libGL at import time even though
 # nothing here does any actual windowing/display work.
+#
+# build-essential: the a6000 GPU preset turns on torch.compile, whose
+# Triton/Inductor backend shells out to a C compiler the FIRST time the
+# model is actually called (not when torch.compile() wraps it) -- without
+# this, that first forward pass crashes with "Failed to find C compiler"
+# on this slim base image, and the try/except around the torch.compile()
+# call in train_dinov2_arcface.py can't catch it since the real
+# compilation is lazy and happens later, outside that try block.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     ca-certificates \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # uv itself — pinned install script, not `pip install uv` (keeps the base
