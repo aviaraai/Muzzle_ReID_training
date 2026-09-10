@@ -148,28 +148,91 @@ def evaluate(model, loss_fn, gallery_loader, query_loader, device):
     query_embs = np.vstack(query_embs).astype(np.float32)
     query_labels = np.array(query_labels)
 
-    # Top-1 / Top-5 via FAISS
-    index = faiss.IndexFlatIP(PROJ_DIM)
-    index.add(np.ascontiguousarray(gallery_embs))
-    _, ids = index.search(np.ascontiguousarray(query_embs), k=5)
+    # Whether this run's gallery(train)/query(val) split shares any identity.
+    # The ORIGINAL foreign-cattle setup this function was written for does:
+    # gallery = 3 images/cattle, query = ~7 MORE images of the SAME cattle —
+    # a closed-set, image-disjoint split, so cross-comparing query embeddings
+    # against the gallery index finds real genuine pairs.
+    #
+    # An identity-DISJOINT split (val identities entirely absent from
+    # training — the open-set generalization test this project actually
+    # wants) breaks that assumption completely: no query image can ever have
+    # a genuine match in the gallery, because its identity was never put
+    # there. Confirmed by running this once, unmodified, against exactly
+    # that kind of split: top1=0.0000, gap=nan (sim[same] was an empty
+    # slice) — and since `best_top1.pt` is only saved when
+    # metrics["top1"] > best_top1 (starts at 0.0), a run like that would
+    # silently produce NO best checkpoint at all, start to finish.
+    #
+    # Detect which case this is and evaluate accordingly, rather than assume.
+    gallery_id_set = set(gallery_labels.tolist())
+    query_id_set = set(query_labels.tolist())
+    identity_disjoint = gallery_id_set.isdisjoint(query_id_set)
 
-    retrieved_labels = gallery_labels[ids]  # (Q, 5)
-    q_col = query_labels[:, None]  # (Q, 1)
-    top1 = float((retrieved_labels[:, 0] == query_labels).mean())
-    top5 = float((retrieved_labels == q_col).any(axis=1).mean())
+    if not identity_disjoint:
+        # Original closed-set protocol, unchanged.
+        index = faiss.IndexFlatIP(PROJ_DIM)
+        index.add(np.ascontiguousarray(gallery_embs))
+        _, ids = index.search(np.ascontiguousarray(query_embs), k=5)
 
-    # Genuine/impostor via single matmul
-    sim = query_embs @ gallery_embs.T  # (Q, G)
-    same = query_labels[:, None] == gallery_labels[None, :]
+        retrieved_labels = gallery_labels[ids]  # (Q, 5)
+        q_col = query_labels[:, None]  # (Q, 1)
+        top1 = float((retrieved_labels[:, 0] == query_labels).mean())
+        top5 = float((retrieved_labels == q_col).any(axis=1).mean())
 
-    gen_mean = float(sim[same].mean())
-    imp_scores = sim[~same]
-    rng = np.random.default_rng(42)
-    if len(imp_scores) > 50_000:
-        imp_scores = rng.choice(imp_scores, 50_000, replace=False)
-    imp_mean = float(imp_scores.mean())
-    gap = gen_mean - imp_mean
+        sim = query_embs @ gallery_embs.T  # (Q, G)
+        same = query_labels[:, None] == gallery_labels[None, :]
 
+        gen_mean = float(sim[same].mean())
+        imp_scores = sim[~same]
+        rng = np.random.default_rng(42)
+        if len(imp_scores) > 50_000:
+            imp_scores = rng.choice(imp_scores, 50_000, replace=False)
+        imp_mean = float(imp_scores.mean())
+        gap = gen_mean - imp_mean
+    else:
+        # Open-set generalization test: leave-one-out retrieval WITHIN the
+        # held-out query set itself (same protocol as this project's own
+        # scratch_ablation_pca.py / scratch_rerank_eval.py) — per-query-image
+        # score against every OTHER query image, per-identity aggregated by
+        # MAX (matching go-apiserver's own cattleScores aggregation), ranked.
+        # This is the number that actually answers "does the fine-tune
+        # generalize to cattle it never saw," which is what this split was
+        # built for.
+        sim_qq = query_embs @ query_embs.T  # (Q, Q)
+        n = len(query_labels)
+        ranks, gen_scores, imp_scores = [], [], []
+        for i in range(n):
+            per_id_max: dict[int, float] = {}
+            for j in range(n):
+                if j == i:
+                    continue
+                s = float(sim_qq[i, j])
+                lbl = int(query_labels[j])
+                if lbl not in per_id_max or s > per_id_max[lbl]:
+                    per_id_max[lbl] = s
+            own_id = int(query_labels[i])
+            if own_id not in per_id_max:
+                continue  # singleton identity in the query set (no other photo to compare)
+            order = sorted(per_id_max.items(), key=lambda kv: -kv[1])
+            rank = [ident for ident, _ in order].index(own_id) + 1
+            ranks.append(rank)
+            gen_scores.append(per_id_max[own_id])
+            imp_scores.append(max(s for ident, s in per_id_max.items() if ident != own_id)
+                               if len(per_id_max) > 1 else float("nan"))
+
+        ranks_arr = np.array(ranks)
+        top1 = float((ranks_arr <= 1).mean()) if len(ranks_arr) else 0.0
+        top5 = float((ranks_arr <= 5).mean()) if len(ranks_arr) else 0.0
+        gen_mean = float(np.mean(gen_scores)) if gen_scores else float("nan")
+        valid_imp = [s for s in imp_scores if not np.isnan(s)]
+        imp_mean = float(np.mean(valid_imp)) if valid_imp else float("nan")
+        gap = gen_mean - imp_mean if valid_imp else float("nan")
+
+    # val_loss still comes from the ArcFace loss on query images — informational
+    # only when identity_disjoint (those classes' ArcFace weight rows never
+    # receive a gradient, since their images never appear in the train loop),
+    # not used for checkpoint selection either way (top1/gap drive that).
     val_loss = vl / max(len(query_loader), 1)
 
     metrics = {
