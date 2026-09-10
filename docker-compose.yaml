@@ -1,0 +1,21 @@
+services:
+  train:
+    build: .
+    image: godhaar-muzzle-reid-train:latest
+    # Requires nvidia-container-toolkit on the host (already implied by
+    # "docker can see the GPU" — this is the standard way compose exposes
+    # it; older Docker/nvidia-docker2 setups may need `runtime: nvidia`
+    # instead of this `deploy.resources` block).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      # Checkpoints/metrics survive `docker compose down` / a container
+      # replace — without this they'd be lost with the container.
+      - ./checkpoints:/workspace/checkpoints
+      - ./results:/workspace/results
+    command: ["--gpu-preset", "auto"]

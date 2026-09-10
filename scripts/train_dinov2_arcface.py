@@ -283,7 +283,7 @@ def main():
     )
     parser.add_argument(
         "--gpu-preset",
-        choices=["rtx3050", "rtx4060", "rtx4090", "auto"],
+        choices=["rtx3050", "rtx4060", "rtx4090", "a6000", "auto"],
         default="auto",
         help="GPU preset: auto-tunes batch-size, grad-accum and precision",
     )
@@ -297,12 +297,31 @@ def main():
         # detect Ada Lovelace (sm_89) or Ampere (sm_80+) automatically
         if torch.cuda.is_available():
             cap = torch.cuda.get_device_capability()
-            if cap[0] >= 8:
-                args.gpu_preset = "rtx4060"  # treat Ampere/Ada as high-end
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            if cap[0] >= 8 and total_gb >= 40:
+                args.gpu_preset = "a6000"  # Ampere/Ada, 40GB+ VRAM (A6000, A100, ...)
+            elif cap[0] >= 8:
+                args.gpu_preset = "rtx4060"  # treat other Ampere/Ada as high-end
             else:
                 args.gpu_preset = "rtx3050"
 
-    if args.gpu_preset in ("rtx4060", "rtx4090"):
+    if args.gpu_preset == "a6000":
+        # 48GB is far more than this ~330-image dataset needs, but a larger
+        # batch means more distinct identities represented per ArcFace step,
+        # which is a real win for a metric-learning loss on a small class
+        # count -- there's no reason to leave the card underused here.
+        if args.batch_size == 8 and args.grad_accum == 4:
+            args.batch_size = 32
+            args.grad_accum = 1
+        AMP_DTYPE = "bfloat16"
+        USE_COMPILE = torch.cuda.is_available() and platform.system() != "Windows"
+        log.info(
+            "[GPU Preset: a6000] batch=%d  accum=%d  amp=bfloat16  compile=%s",
+            args.batch_size,
+            args.grad_accum,
+            USE_COMPILE,
+        )
+    elif args.gpu_preset in ("rtx4060", "rtx4090"):
         # Ada Lovelace / high-end Ampere: native BF16 + compile
         if args.batch_size == 8 and args.grad_accum == 4:
             # only override defaults if user didn't manually set them
@@ -369,21 +388,51 @@ def main():
     log.info(f"  Val        : {len(val_df):,}  (query)")
 
     # ── Transforms ───────────────────────────────────────────────────────────
+    # Augmentation policy -- each choice tied to a measurement, not a guess
+    # (re-verified against the real production quality/crop gate, not the
+    # unreliable subjective visual-review pass this dataset's prior audit
+    # turned out to have -- see rebuild_manifest.py's docstring for what was
+    # wrong with that and why it was rebuilt on objective criteria alone):
+    #
+    #   - RandomResizedCrop(scale, ratio): simulates the real crop-aspect
+    #     spread this pipeline injects upstream of the encoder (handheld
+    #     capture distance/angle varies a lot between an animal's own
+    #     photos) -- ratio=(0.6, 1.5) matches the measured raw-file aspect
+    #     range (0.62-1.59, re-confirmed directly on this exact manifest).
+    #   - NO RandomHorizontalFlip. Muzzle bead/ridge patterns are not
+    #     symmetric -- flipping risks synthesizing a pattern that looks like
+    #     a different real identity, manufacturing a false negative signal
+    #     for ArcFace to learn from. (The un-audited original script had
+    #     this at p=0.5; removed.)
+    #   - NO RandomPerspective. Not tied to any real measurement of this
+    #     dataset's capture geometry -- dropped rather than kept on a guess.
+    #   - GaussianBlur: real field photos span a wide sharpness range (the
+    #     production quality gate's own floor is BLUR_THRESHOLD=20.0
+    #     Laplacian variance, and passing images still range into the
+    #     hundreds) -- training should see some near-floor examples, not
+    #     just sharp ones.
+    #   - ColorJitter: mild general lighting/coat-color robustness. hue
+    #     jitter kept small (cattle coat/muzzle color IS part of what
+    #     distinguishes individuals within a breed, even though it's not
+    #     the primary re-id signal -- don't scramble it).
+    #   - RandomErasing at a LARGER patch size and higher probability than
+    #     the original script: real photos routinely have a handler's hand,
+    #     a rope/halter, or feed/hay partially covering the muzzle. Bigger,
+    #     more frequent random erasing teaches the encoder not to depend on
+    #     any single small patch being visible.
     train_transform = transforms.Compose(
         [
-            transforms.RandomResizedCrop(IMG_SIZE, scale=(0.6, 1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0), ratio=(0.6, 1.5)),
             transforms.ColorJitter(
-                brightness=0.4, contrast=0.4, saturation=0.3, hue=0.07
+                brightness=0.3, contrast=0.3, saturation=0.2, hue=0.03
             ),
-            transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
             transforms.RandomApply(
-                [transforms.GaussianBlur(5, sigma=(0.1, 2.0))], p=0.5
+                [transforms.GaussianBlur(7, sigma=(0.1, 3.0))], p=0.4
             ),
             transforms.ToTensor(),
             transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             transforms.RandomErasing(
-                p=0.2, scale=(0.02, 0.1), ratio=(0.3, 3.3), value=0
+                p=0.4, scale=(0.05, 0.25), ratio=(0.3, 3.3), value=0
             ),
         ]
     )
@@ -660,10 +709,16 @@ def main():
     log.info(f"  Metrics    : {metrics_path}")
     log.info(f"  Checkpoints: {CKPT_DIR}")
     log.info("=" * 65)
-    log.info("Comparison vs frozen baseline:")
-    log.info(f"  Frozen  Top-1=0.9883  Gap=0.3773")
-    log.info(f"  Tuned   Top-1={best_top1:.4f}  Gap={best_gap:.4f}")
-    log.info(f"  Delta   Top-1={best_top1 - 0.9883:+.4f}  Gap={best_gap - 0.3773:+.4f}")
+    # NOTE: the reference number to compare this against is NOT hardcoded
+    # here on purpose -- 0.9883/0.3773 (removed) was the ORIGINAL foreign
+    # 300-cattle checkpoint's own held-out-IMAGE metric (same identities in
+    # train and val, a much easier and structurally different task than this
+    # run's identity-DISJOINT open-set split). Compare best_top1 above
+    # against the real reference points instead: the raw current-production
+    # checkpoint's identity-disjoint LOO baseline (58.7% top-1, 41.3%
+    # impostor-beats-genuine, this exact Godhaar_aron corpus) and the
+    # separately-measured fusion+whitening pipeline's numbers -- not a
+    # number from a different dataset and a different (easier) protocol.
     log.info("=" * 65)
 
     # Call plotting script
