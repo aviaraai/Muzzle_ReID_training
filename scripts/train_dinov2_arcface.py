@@ -318,9 +318,21 @@ def main():
             args.batch_size = 32
             args.grad_accum = 1
         AMP_DTYPE = "bfloat16"
-        USE_COMPILE = torch.cuda.is_available() and platform.system() != "Windows"
+        # torch.compile deliberately OFF here. Two reasons, both specific to
+        # this run rather than general distrust of compile:
+        #   1. Hard-negative injection (epoch 5 onward) appends a variable
+        #      number of extra samples to each batch, so the batch dimension
+        #      changes from step to step. compile guards on input shape, and
+        #      mode="reduce-overhead" backs onto CUDA graphs, which is the
+        #      configuration least tolerant of shifting shapes.
+        #   2. This dataset is ~330 training images -- roughly 10 steps per
+        #      epoch. Compilation overhead is paid against a few hundred
+        #      steps total, so there is very little wall-clock left to win.
+        # It also removes the Triton/C-compiler dependency inside the
+        # container entirely, which is what broke the first A6000 run.
+        USE_COMPILE = False
         log.info(
-            "[GPU Preset: a6000] batch=%d  accum=%d  amp=bfloat16  compile=%s",
+            "[GPU Preset: a6000] batch=%d  accum=%d  amp=bfloat16  compile=%s (off by design)",
             args.batch_size,
             args.grad_accum,
             USE_COMPILE,
