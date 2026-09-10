@@ -1,23 +1,29 @@
 """
 scripts/train_dinov2_arcface.py — Fine-tune DINOv2 + Sub-center ArcFace
 
-300-Cattle muzzle dataset.
-  Train = gallery (3 images/cattle → 900 images)
-  Val   = query   (~7 images/cattle → ~2000 images)
+Godhaar_aron dataset (data/benchmark_manifest.csv):
+  Train = gallery — 331 images / 103 identities
+  Val   = query   —  57 images /  18 identities
+The split is identity-DISJOINT: no validation identity appears in training.
+That mirrors production, which matches against animals the encoder never saw,
+and is why evaluate() does leave-one-out retrieval within the query set
+rather than querying it against the gallery.
 
-Freeze Schedule:
-  Epoch  1–10 : Blocks 10–11 + LayerNorm + Head
-  Epoch 11–30 : Blocks 8–11  + LayerNorm + Head
-  Epoch 31–50 : Blocks 6–11  + LayerNorm + Head
+Freeze schedule (the authority is _FREEZE_SCHEDULE in model.py, not this
+comment — keep the two in step if you change it):
+  Epoch  1–15 : Block 11    + LayerNorm + Head + GeM   ( 7.6M trainable)
+  Epoch 16–35 : Blocks 9–11 + LayerNorm + Head + GeM   (21.8M trainable)
+  Epoch 36–60 : Blocks 9–11 — unchanged from the previous phase
 
 Saves:
-  checkpoints/best_top1_encoder.pt
-  checkpoints/best_top1_arcface.pt
-  checkpoints/best_gap_encoder.pt
-  checkpoints/best_gap_arcface.pt
-  checkpoints/last_encoder.pt
-  checkpoints/last_arcface.pt
-  results/metrics.csv
+  checkpoints/last.pt        — every epoch; the --resume point, not a deliverable
+  checkpoints/best_top1.pt   — best retrieval Top-1 so far
+  checkpoints/best_gap.pt    — best genuine/impostor separation so far
+  results/metrics.csv, results/training.log, results/loss_curves.png
+
+Each checkpoint carries optimizer state, so --resume is only valid across
+runs of the SAME code: if the set of parameters handed to the optimizer
+changes, an older checkpoint will not load. Delete checkpoints/ instead.
 
 Usage:
   uv run python scripts/train_dinov2_arcface.py --batch-size 8 --grad-accum 4

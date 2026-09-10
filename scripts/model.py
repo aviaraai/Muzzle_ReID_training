@@ -15,9 +15,15 @@ This contract is frozen — downstream fusion layers depend on it.
 
 Freeze schedule
 ---------------
-Epochs  1–10 : blocks 10–11 + LayerNorm + head
-Epochs 11–30 : blocks  8–11 + LayerNorm + head
-Epochs 31–50 : blocks  6–11 + LayerNorm + head
+Epochs  1–15 : block  11    + LayerNorm + head + GeM
+Epochs 16–35 : blocks  9–11 + LayerNorm + head + GeM
+Epochs 36–60 : blocks  9–11 — same as the previous phase
+
+_FREEZE_SCHEDULE below is the authority; this block just restates it.
+Note the third phase opens nothing new: it repeats phase two rather than
+descending to block 6. That is deliberate for a ~330-image training set,
+where unfreezing half the backbone invites overfitting — but it does mean
+epochs 36–60 add depth-wise capacity only in name.
 
 Design goals
 ------------
@@ -697,11 +703,27 @@ class GodhaarModel(nn.Module):
                 for p in module.parameters():
                     ln_param_ids.add(id(p))
 
+        # NOTE: these deliberately do NOT filter on param.requires_grad.
+        #
+        # The optimizer is built exactly once, at epoch 1, when the freeze
+        # schedule has only block 11 open. progressive_unfreeze() later opens
+        # blocks 9-10 at epoch 16 by flipping requires_grad back on -- but a
+        # param that was excluded here is not in the optimizer, so it would
+        # collect gradients that AdamW never applies. Measured: from epoch 16
+        # on, 14,178,816 of 21,795,585 trainable params (65%) were orphaned,
+        # silently making the entire progressive-unfreezing schedule a no-op
+        # past epoch 15. Nothing raises -- the run just quietly trains a
+        # single block for 60 epochs.
+        #
+        # Handing frozen params to AdamW is safe: its step loop skips any
+        # param whose .grad is None, so a frozen param is neither updated nor
+        # weight-decayed, and its optimizer state is allocated lazily on the
+        # first step it actually receives a gradient.
         def _split(named_params, exclude_ids: set = frozenset()):
             """Split into (wd, no_wd) excluding params in exclude_ids."""
             decay, no_decay = [], []
             for name, param in named_params:
-                if not param.requires_grad or id(param) in exclude_ids:
+                if id(param) in exclude_ids:
                     continue
                 if param.ndim <= 1 or name.endswith(".bias"):
                     no_decay.append(param)
@@ -713,7 +735,7 @@ class GodhaarModel(nn.Module):
             """Extract LayerNorm params into (wd, no_wd) by id."""
             decay, no_decay = [], []
             for name, param in named_params:
-                if not param.requires_grad or id(param) not in ln_param_ids:
+                if id(param) not in ln_param_ids:
                     continue
                 if param.ndim <= 1 or name.endswith(".bias"):
                     no_decay.append(param)
@@ -770,9 +792,9 @@ class GodhaarModel(nn.Module):
 
         Freeze schedule
         ---------------
-        Epochs  1–10 → unfreeze blocks 10–11 only
-        Epochs 11–30 → unfreeze blocks  8–11
-        Epochs 31–50 → unfreeze blocks  6–11
+        Epochs  1–15 → unfreeze block  11 only
+        Epochs 16–35 → unfreeze blocks  9–11
+        Epochs 36–60 → unchanged; still blocks 9–11
 
         Parameters
         ----------
