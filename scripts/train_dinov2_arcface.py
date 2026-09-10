@@ -563,12 +563,35 @@ def main():
     patience = 15
     epochs_no_improve = 0
     best_epoch = start_epoch - 1
+    last_unfreeze_from = None
 
     log.info("\nStarting training...\n")
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        model.progressive_unfreeze(epoch)
+        unfreeze_from = model.progressive_unfreeze(epoch)
+
+        # Reset the early-stopping counter whenever the freeze schedule
+        # unfreezes MORE of the backbone. Without this, a plateau reached
+        # under a MORE restrictive freeze state (fewer trainable params --
+        # only 8.7% of the model during epochs 1-15, per the freeze
+        # schedule in godhaar/model.py) can trigger early stopping at
+        # patience=15 BEFORE the model ever gets access to the deeper
+        # blocks the schedule was going to unfreeze at epoch 16 -- on a
+        # dataset this small (331 train images), where the block-11-only
+        # phase can plausibly saturate quickly, that means blocks 9-11 and
+        # 6-11 might never be touched at all, silently. A prior plateau
+        # under less capacity says nothing about what happens once the
+        # model gets more of it, so it must not count against a freshly
+        # more-capable model.
+        if last_unfreeze_from is not None and unfreeze_from != last_unfreeze_from:
+            if epochs_no_improve > 0:
+                log.info(
+                    f"  Freeze schedule advanced (unfreeze_from {last_unfreeze_from}->{unfreeze_from}) "
+                    f"-- resetting early-stopping counter (was {epochs_no_improve}/{patience})"
+                )
+            epochs_no_improve = 0
+        last_unfreeze_from = unfreeze_from
 
         # Hard negative mining (every 5 epochs)
         if epoch % 5 == 0 and cached_gallery_embs is not None:
