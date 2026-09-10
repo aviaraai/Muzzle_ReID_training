@@ -113,7 +113,11 @@ class MuzzleDataset(Dataset):
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
         label = self.label_map[cattle_id]
-        return img, label
+        # idx is returned alongside (img, label) so hard-negative injection
+        # can key off each sample's REAL position in this dataset -- see the
+        # training loop's comment on why that must not be reconstructed from
+        # a shuffled DataLoader's step number.
+        return img, label, idx
 
 
 # =============================================================================
@@ -126,7 +130,7 @@ def evaluate(model, loss_fn, gallery_loader, query_loader, device):
     model.eval()
 
     gallery_embs, gallery_labels = [], []
-    for imgs, lbls in gallery_loader:
+    for imgs, lbls, _idxs in gallery_loader:
         with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
             e = model(imgs.to(device))
         gallery_embs.append(e.cpu().numpy())
@@ -136,7 +140,7 @@ def evaluate(model, loss_fn, gallery_loader, query_loader, device):
 
     query_embs, query_labels = [], []
     vl = 0.0
-    for imgs, lbls in query_loader:
+    for imgs, lbls, _idxs in query_loader:
         imgs_dev = imgs.to(device)
         lbls_dev = lbls.to(device)
         with torch.amp.autocast(device_type="cuda", enabled=(device.type == "cuda")):
@@ -606,18 +610,23 @@ def main():
         n_batches = 0
         optimizer.zero_grad()
 
-        for step, (imgs, labels) in enumerate(train_loader):
-            # Inject hard negatives
+        for step, (imgs, labels, idxs) in enumerate(train_loader):
+            # Inject hard negatives, keyed to the REAL dataset position of
+            # each anchor actually in this batch (idxs, from MuzzleDataset --
+            # train_loader has shuffle=True, so `step*batch_size` is NOT the
+            # position range of what's in this batch; using it to index
+            # hard_negs was silently injecting negatives keyed to whichever
+            # samples happened to occupy those positions before shuffling,
+            # unrelated to this batch's actual anchors -- found by tracing
+            # this end to end, not by running it, since it never raised or
+            # produced an obviously-wrong loss value).
             if hard_negs:
-                start = step * args.batch_size
                 extra_imgs, extra_labels = [], []
-                for idx in range(
-                    start, min(start + args.batch_size, len(train_dataset))
-                ):
+                for idx in idxs.tolist():
                     pool = hard_negs.get(idx, [])
                     if pool:
                         ni = random.choice(pool)
-                        neg_img, neg_label = gallery_dataset[ni]
+                        neg_img, neg_label, _ = gallery_dataset[ni]
                         extra_imgs.append(neg_img)
                         extra_labels.append(neg_label)
                 if extra_imgs:
