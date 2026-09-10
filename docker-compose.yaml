@@ -13,6 +13,15 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    # PyTorch's DataLoader (num_workers=2, persistent_workers=True in
+    # train_dinov2_arcface.py) passes batches between the main process and
+    # worker processes via /dev/shm. Docker containers default to a tiny
+    # 64MB shm, which is not enough -- without this, torch's DataLoader
+    # workers fail with "unable to allocate shared memory(shm)" on the
+    # very first batch. 2GB is generous for this dataset's batch sizes
+    # (well over what's needed even at the a6000 preset's batch=32) but
+    # costs nothing to reserve.
+    shm_size: '2gb'
     volumes:
       # Checkpoints/metrics survive `docker compose down` / a container
       # replace — without this they'd be lost with the container.
