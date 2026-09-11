@@ -1,21 +1,36 @@
 """
 scripts/train_dinov2_arcface.py — Fine-tune DINOv2 + Sub-center ArcFace
 
-Godhaar_aron dataset (data/benchmark_manifest.csv):
-  Train = gallery — 331 images / 103 identities
-  Val   = query   —  57 images /  18 identities
-The split is identity-DISJOINT: no validation identity appears in training.
-That mirrors production, which matches against animals the encoder never saw,
-and is why evaluate() does leave-one-out retrieval within the query set
-rather than querying it against the gallery.
+Two stages, two arms, selected by flag.
+
+  --stage pretrain   folder-scans the 300-identity corpus (~2,460 images,
+                     median 10 per identity), 45 held-out identities
+  --stage finetune   the Uttarakhand manifest; refuses to start unless its
+                     split_hash is the locked 1574f9bc...
+
+  --arm full         518 full frames (~0.7 mm/px on the muzzle -- a 1mm ridge
+                     gets ~1.4px, below Nyquist for the finest structure)
+  --arm crop         518 muzzle crops (0.232 mm/px, ~4.3px per 1mm ridge).
+                     Self-consistent: train, val and gallery all cropped, and
+                     the run aborts if any input is not, because a mixed arm
+                     reproduces the measured -22 point collapse.
+
+Both splits are identity-DISJOINT and assert it on startup. That mirrors
+production, which matches against animals the encoder never saw, and is why
+evaluate() does leave-one-out retrieval within the query set rather than
+querying it against the gallery.
 
 Freeze schedule (the authority is _FREEZE_SCHEDULE in model.py, not this
 comment — keep the two in step if you change it):
-  Epoch  1–15 : Block 11    + LayerNorm + Head + GeM   ( 7.6M trainable)
-  Epoch 16–35 : Blocks 9–11 + LayerNorm + Head + GeM   (21.8M trainable)
-  Epoch 36–60 : Blocks 9–11 — unchanged from the previous phase
+  Epoch  1–5  : Block 11    + LayerNorm + Head + GeM   ( 7.6M trainable)
+  Epoch  6–20 : Blocks 9–11 + LayerNorm + Head + GeM   (21.8M)
+  Epoch 21–45 : Blocks 6–11 + LayerNorm + Head + GeM   (~43M)
+  Epoch 46–80 : Blocks 4–11 + LayerNorm + Head + GeM   (~57M)
 
 Saves:
+  checkpoints/phase_epochNN.pt — one per freeze-phase boundary (5/20/45/80),
+                     kept so a failed frequency probe can be traced to the
+                     phase where texture was still being read
   checkpoints/last.pt        — every epoch; the --resume point, not a deliverable
   checkpoints/best_top1.pt   — best retrieval Top-1 so far
   checkpoints/best_gap.pt    — best genuine/impostor separation so far
@@ -52,7 +67,11 @@ from losses import (
     load_arcface,
     save_arcface,
 )
-from model import GodhaarModel, build_model
+from model import GodhaarModel, build_model, _FREEZE_SCHEDULE
+from augment import build_train_transform, build_val_transform
+from corpus import (REQUIRED_SPLIT_HASH, load_clusters, load_folder_corpus,
+                    load_manifest_corpus)
+from sampler import PKClusterSampler
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -89,6 +108,10 @@ ARCFACE_MARGIN = 0.5  # ~28.6°
 # LOGGING
 # =============================================================================
 
+# Epochs at which a freeze phase ends -- checkpointed for the texture-vs-
+# appearance post-mortem described at the save site below.
+_PHASE_BOUNDARY_EPOCHS = {end for _s, end, _b in _FREEZE_SCHEDULE}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -103,22 +126,23 @@ log = logging.getLogger("godhaar.train")
 
 
 class MuzzleDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, transform, label_map: dict[str, int]):
-        self.df = df.reset_index(drop=True)
+    """Backed by a corpus.Corpus, so the same class serves both the
+    folder-scanned 300-identity corpus and the manifest-described Uttarakhand
+    split without the training loop knowing which it got."""
+
+    def __init__(self, corpus, transform):
+        self.corpus = corpus
         self.transform = transform
-        self.label_map = label_map
+        self.label_map = corpus.label_map
 
     def __len__(self):
-        return len(self.df)
+        return len(self.corpus)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        cattle_id = row["CattleID"]
-        img_name = row["Image"]
-        img_path = DATA_ROOT / cattle_id / img_name
+        img_path = self.corpus.paths[idx]
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
-        label = self.label_map[cattle_id]
+        label = self.corpus.labels[idx]
         # idx is returned alongside (img, label) so hard-negative injection
         # can key off each sample's REAL position in this dataset -- see the
         # training loop's comment on why that must not be reconstructed from
@@ -282,7 +306,28 @@ def compute_hard_negatives(gallery_embs, gallery_labels, top_k=20):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--stage", choices=["pretrain", "finetune"], default="finetune",
+                        help="pretrain = folder-scan the 300-identity corpus; "
+                             "finetune = the Uttarakhand manifest (split_hash enforced)")
+    parser.add_argument("--arm", choices=["full", "crop"], default="full",
+                        help="full = 518 full frames; crop = 518 muzzle crops, "
+                             "self-consistent (train, val and gallery all cropped)")
+    parser.add_argument("--corpus-dir", default=None,
+                        help="root of the folder-scanned corpus (stage=pretrain)")
+    parser.add_argument("--crop-marker", default="crop",
+                        help="substring every path must contain when --arm crop")
+    parser.add_argument("--clusters", default=str(ROOT / "results" / "part3_appearance_clusters.json"))
+    parser.add_argument("--val-identities", type=int, default=45)
+    parser.add_argument("--seed", type=int, default=20260911)
+    parser.add_argument("--pk-p", type=int, default=8)
+    parser.add_argument("--pk-k", type=int, default=4)
+    parser.add_argument("--pk-same", type=int, default=6)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--monitor", choices=["gap", "top1"], default="gap",
+                        help="early-stopping metric. gap by default: the 17-epoch "
+                             "run had top-1 flat from epoch 12 while separation "
+                             "climbed to the final epoch")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--lr-backbone", type=float, default=5e-5)
@@ -298,6 +343,8 @@ def main():
         help="GPU preset: auto-tunes batch-size, grad-accum and precision",
     )
     args = parser.parse_args()
+    import sys as _sys
+    args._explicit_lr = any(a.startswith("--lr-") for a in _sys.argv[1:])
 
     # ── GPU preset overrides ──────────────────────────────────────────────────
     AMP_DTYPE = "float16"  # default (safe for all GPUs)
@@ -365,6 +412,15 @@ def main():
             args.grad_accum,
         )
 
+    # Stage 2 is a domain adaptation, not a re-training: 439 images cannot
+    # support deep unfreezing. Blocks 0-8 stay frozen throughout; only 9-11 +
+    # LayerNorm + head + GeM move, at 10x lower LR than pretraining.
+    if args.stage == "finetune" and not args._explicit_lr:
+        args.lr_backbone, args.lr_head = 1e-5, 1e-4
+        if args.epochs == 80:
+            args.epochs = 30
+        log.info("  Stage-2    : LR backbone=1e-5 head=1e-4, 30 epochs, blocks 0-8 frozen")
+
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -396,18 +452,43 @@ def main():
     log.info(f"  LR         : backbone={args.lr_backbone}  head={args.lr_head}")
     log.info("=" * 65)
 
-    # ── Manifest ─────────────────────────────────────────────────────────────
-    df = pd.read_csv(MANIFEST, dtype=str)
-    train_df = df[df["Split"] == "gallery"].reset_index(drop=True)
-    val_df = df[df["Split"] == "query"].reset_index(drop=True)
+    # ── Corpus ───────────────────────────────────────────────────────────────
+    # Two on-disk formats, one interface. Stage 1 folder-scans the 300-identity
+    # corpus; stage 2 reads the Uttarakhand manifest and refuses to start
+    # unless its split_hash is the locked one. Both assert identity-disjointness
+    # internally and abort rather than train on a leaky split.
+    if args.stage == "pretrain":
+        corpus_dir = Path(args.corpus_dir) if args.corpus_dir else ROOT / "data"
+        log.info(f"  Stage      : PRETRAIN (folder scan)  {corpus_dir}")
+        train_corpus, val_corpus = load_folder_corpus(
+            corpus_dir, n_val_identities=args.val_identities, seed=args.seed)
+    else:
+        log.info(f"  Stage      : FINETUNE (manifest)  {MANIFEST}")
+        train_corpus, val_corpus = load_manifest_corpus(
+            MANIFEST, DATA_ROOT, require_split_hash=REQUIRED_SPLIT_HASH)
 
-    all_ids = sorted(df["CattleID"].unique().tolist())
-    label_map = {cid: i for i, cid in enumerate(all_ids)}
-    num_classes = len(label_map)
+    num_classes = train_corpus.num_classes
+    log.info(f"  Arm        : {args.arm}")
+    log.info(f"  Classes    : {num_classes}  (train identities)")
+    log.info(f"  Train      : {len(train_corpus):,} images / {num_classes} identities")
+    log.info(f"  Val        : {len(val_corpus):,} images / {val_corpus.num_classes} identities "
+             f"(identity-disjoint, asserted)")
 
-    log.info(f"  Classes    : {num_classes}")
-    log.info(f"  Train      : {len(train_df):,}  (gallery)")
-    log.info(f"  Val        : {len(val_df):,}  (query)")
+    # Arm 2 is only meaningful if EVERY input is cropped -- train, val and the
+    # gallery used for retrieval alike. A mixed arm reproduces the measured
+    # -22 point collapse inside the experiment and would be indistinguishable
+    # from the texture hypothesis failing.
+    if args.arm == "crop":
+        bad = [p for p in list(train_corpus.paths[:50]) + list(val_corpus.paths[:50])
+               if args.crop_marker not in str(p)]
+        if bad:
+            raise SystemExit(
+                f"ABORT: --arm crop requires every input to come from a cropped corpus "
+                f"(path must contain {args.crop_marker!r}), but e.g. {bad[0]} does not. "
+                "A mixed arm silently reproduces the -22 point cropped-vs-uncropped "
+                "collapse and would invalidate the experiment."
+            )
+        log.info(f"  Arm check  : all inputs cropped (marker {args.crop_marker!r}) OK")
 
     # ── Transforms ───────────────────────────────────────────────────────────
     # Augmentation policy -- each choice tied to a measurement, not a guess
@@ -442,43 +523,37 @@ def main():
     #     a rope/halter, or feed/hay partially covering the muzzle. Bigger,
     #     more frequent random erasing teaches the encoder not to depend on
     #     any single small patch being visible.
-    train_transform = transforms.Compose(
-        [
-            transforms.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0), ratio=(0.6, 1.5)),
-            transforms.ColorJitter(
-                brightness=0.3, contrast=0.3, saturation=0.2, hue=0.03
-            ),
-            transforms.RandomApply(
-                [transforms.GaussianBlur(7, sigma=(0.1, 3.0))], p=0.4
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            transforms.RandomErasing(
-                p=0.4, scale=(0.05, 0.25), ratio=(0.3, 3.3), value=0
-            ),
-        ]
-    )
+    # Augmentation lives in augment.py so the removals are documented next to
+    # the measurements that justify them. GaussianBlur(sigma<=3.0) and
+    # RandomResizedCrop(ratio 0.6-1.5) are GONE -- the first destroys the band
+    # this experiment measures, the second manufactures aspect distortion far
+    # outside the observed [0.78, 1.09].
+    train_transform = build_train_transform(IMG_SIZE)
+    val_transform = build_val_transform(IMG_SIZE)
+    log.info("  Augment    : " + ", ".join(type(t).__name__ for t in train_transform.transforms))
 
-    val_transform = transforms.Compose(
-        [
-            transforms.Resize((IMG_SIZE, IMG_SIZE)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ]
-    )
+    train_dataset = MuzzleDataset(train_corpus, train_transform)
+    gallery_dataset = MuzzleDataset(train_corpus, val_transform)
+    val_dataset = MuzzleDataset(val_corpus, val_transform)
 
-    train_dataset = MuzzleDataset(train_df, train_transform, label_map)
-    gallery_dataset = MuzzleDataset(train_df, val_transform, label_map)
-    val_dataset = MuzzleDataset(val_df, val_transform, label_map)
+    # P x K sampling with appearance-cluster hard negatives. Without it a
+    # batch of eight differently-coloured animals is separable on colour alone
+    # and the model never has to read the print -- which is the entire point
+    # of the pretraining run.
+    clusters = load_clusters(Path(args.clusters), set(train_corpus.identities))
+    sampler = PKClusterSampler(
+        train_corpus.indices_by_identity(), clusters,
+        P=args.pk_p, K=args.pk_k, same_cluster=args.pk_same, seed=args.seed)
+    log.info(f"  Sampler    : P={args.pk_p} x K={args.pk_k} = {args.pk_p*args.pk_k}/batch, "
+             f"{args.pk_same} of {args.pk_p} identities from one appearance cluster, "
+             f"{len(sampler)} batches/epoch")
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=sampler,
         num_workers=2,
         pin_memory=True,
         persistent_workers=True,
         prefetch_factor=2,
-        drop_last=True,
     )
     gallery_loader = DataLoader(
         gallery_dataset,
@@ -534,6 +609,24 @@ def main():
         ),
     )
 
+    # The invariant that matters most in this file. parameter_groups() must
+    # hand AdamW the WHOLE backbone, including the parts the freeze schedule
+    # has not opened yet -- otherwise every phase past the first silently
+    # trains nothing. That regression shipped an untrained backbone to
+    # production for months (fix 15a9115, pinned by
+    # scripts/test_training.py::test_optimizer_holds_every_backbone_param_at_construction).
+    _in_opt = {id(p) for g in optimizer.param_groups for p in g["params"]}
+    _bb_held = sum(p.numel() for p in model.backbone.parameters() if id(p) in _in_opt)
+    _bb_total = sum(p.numel() for p in model.backbone.parameters())
+    if _bb_held != _bb_total:
+        raise SystemExit(
+            f"ABORT: optimizer holds {_bb_held:,} of {_bb_total:,} backbone params. "
+            "parameter_groups() is filtering on requires_grad again -- the freeze "
+            "schedule would be a silent no-op. Refusing to train."
+        )
+    log.info(f"  Optimizer  : holds {_bb_held:,}/{_bb_total:,} backbone params "
+             f"(all phases will actually train)")
+
     total_steps = args.epochs * math.ceil(len(train_loader) / args.grad_accum)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
     # BF16 doesn't need a loss scaler (no underflow risk); FP16 does.
@@ -582,7 +675,7 @@ def main():
     cached_gallery_embs = None
     cached_gallery_labels = None
 
-    patience = 15
+    patience = args.patience
     epochs_no_improve = 0
     best_epoch = start_epoch - 1
     last_unfreeze_from = None
@@ -729,16 +822,31 @@ def main():
 
         model.save_checkpoint(CKPT_DIR / "last.pt", **shared_ckpt_kwargs)
 
+        # Freeze-phase boundaries. If the frequency probe later says the
+        # encoder reads appearance rather than texture, these are the only way
+        # to tell whether an EARLIER phase read texture before deeper
+        # unfreezing let it drift back -- a diagnostic that cannot be
+        # reconstructed after the fact.
+        if epoch in _PHASE_BOUNDARY_EPOCHS:
+            model.save_checkpoint(CKPT_DIR / f"phase_epoch{epoch:02d}.pt", **shared_ckpt_kwargs)
+            log.info(f"  → freeze-phase boundary checkpoint: phase_epoch{epoch:02d}.pt")
+
         is_best = False
-        if metrics["top1"] > best_top1:
+        improved_top1 = metrics["top1"] > best_top1
+        improved_gap = metrics["gap"] > best_gap
+        # The early-stopping counter tracks --monitor (separation by default);
+        # both checkpoints are still written on their own metric.
+        if (improved_gap if args.monitor == "gap" else improved_top1):
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if improved_top1:
             best_top1 = metrics["top1"]
             best_epoch = epoch
-            epochs_no_improve = 0
             is_best = True
             model.save_checkpoint(CKPT_DIR / "best_top1.pt", **shared_ckpt_kwargs)
             log.info(f"  ★ New best Top-1: {best_top1:.4f}")
-        else:
-            epochs_no_improve += 1
 
         if metrics["gap"] > best_gap:
             best_gap = metrics["gap"]

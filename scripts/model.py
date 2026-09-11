@@ -15,15 +15,15 @@ This contract is frozen — downstream fusion layers depend on it.
 
 Freeze schedule
 ---------------
-Epochs  1–15 : block  11    + LayerNorm + head + GeM
-Epochs 16–35 : blocks  9–11 + LayerNorm + head + GeM
-Epochs 36–60 : blocks  9–11 — same as the previous phase
+Epochs  1–5  : block  11    + LayerNorm + head + GeM   ( 7.6M trainable)
+Epochs  6–20 : blocks  9–11 + LayerNorm + head + GeM   (21.8M)
+Epochs 21–45 : blocks  6–11 + LayerNorm + head + GeM   (~43M)
+Epochs 46–80 : blocks  4–11 + LayerNorm + head + GeM   (~57M)
 
 _FREEZE_SCHEDULE below is the authority; this block just restates it.
-Note the third phase opens nothing new: it repeats phase two rather than
-descending to block 6. That is deliberate for a ~330-image training set,
-where unfreezing half the backbone invites overfitting — but it does mean
-epochs 36–60 add depth-wise capacity only in name.
+Sized for the 300-identity pretraining corpus (~2,460 images, median 10 per
+identity), not the 331-image set the previous schedule targeted. Every phase
+opens something now; the old third phase repeated the second verbatim.
 
 Design goals
 ------------
@@ -82,10 +82,26 @@ _NUM_PATCHES: int       = (_IMG_SIZE // _PATCH_SIZE) ** 2  # 37×37 = 1 369
 # Freeze schedule: (epoch_start, epoch_end, first_block_to_unfreeze)
 # Blocks [unfreeze_from .. 11] are trained; earlier blocks stay frozen.
 _FREEZE_SCHEDULE: List[Tuple[int, int, int]] = [
-    (1,  15, 11),   # epochs  1–15  → unfreeze block 11 only
-    (16, 35,  9),   # epochs 16–35  → unfreeze blocks 9–11
-    (36, 60,  9),   # epochs 36–60  → keep blocks 9–11
+    (1,   5, 11),   # epochs  1–5   → block 11            ( 7.6M trainable)
+    (6,  20,  9),   # epochs  6–20  → blocks 9–11         (21.8M)
+    (21, 45,  6),   # epochs 21–45  → blocks 6–11         (~43M)
+    (46, 80,  4),   # epochs 46–80  → blocks 4–11         (~57M)
 ]
+# Re-sized for the 300-identity pretraining corpus: ~2,460 training images at
+# a median of 10 per identity, against the 331 images / 3-per-identity this
+# schedule was originally written for. With 8.8x the data there is no reason
+# to dwell on a single block for 15 epochs, and enough signal to open half the
+# backbone by the end. Every phase now opens something — the old third phase
+# (36,60,9) repeated the second verbatim and added depth-wise capacity in name
+# only.
+#
+# Mid-level blocks are the target: 6–11 is where texture-scale features live
+# in a ViT, and reading the muzzle print rather than the animal's appearance
+# is the whole point of the pretraining run.
+#
+# This schedule is load-bearing on the optimizer fix in parameter_groups()
+# below. Before that fix, zero backbone params reached AdamW and every phase
+# here would be a silent no-op.
 
 # ---------------------------------------------------------------------------
 # Generalized Mean Pooling (GeM)
@@ -792,9 +808,10 @@ class GodhaarModel(nn.Module):
 
         Freeze schedule
         ---------------
-        Epochs  1–15 → unfreeze block  11 only
-        Epochs 16–35 → unfreeze blocks  9–11
-        Epochs 36–60 → unchanged; still blocks 9–11
+        Epochs  1–5  → unfreeze block  11 only
+        Epochs  6–20 → unfreeze blocks  9–11
+        Epochs 21–45 → unfreeze blocks  6–11
+        Epochs 46–80 → unfreeze blocks  4–11
 
         Parameters
         ----------
