@@ -582,6 +582,40 @@ def main():
         prefetch_factor=2,
     )
 
+    # ── Auto-resume ──────────────────────────────────────────────────────────
+    # If the run stops for any reason (killed, machine reboot, OOM) and gets
+    # restarted with the SAME command, it should not silently repeat epochs
+    # already paid for on an A6000. Detect an existing last.pt and resume
+    # automatically rather than requiring --resume to be remembered.
+    #
+    # This is safe only because it is guarded: checkpoints/ is a single
+    # directory shared across every stage/arm combination, so a bare "does
+    # last.pt exist" check would happily resume a finetune run onto a
+    # pretrain checkpoint, or a crop-arm run onto a full-arm one -- wrong
+    # num_classes, wrong optimizer param groups, wrong everything. Compare
+    # the checkpoint's own recorded stage/arm/class-count against this
+    # invocation first; a mismatch aborts instead of corrupting the run.
+    _last_ckpt_path = CKPT_DIR / "last.pt"
+    if not args.resume and _last_ckpt_path.exists():
+        _peek = torch.load(_last_ckpt_path, map_location="cpu", weights_only=False)
+        _match = (_peek.get("stage") == args.stage and _peek.get("arm") == args.arm
+                 and _peek.get("config", {}).get("num_classes") == num_classes)
+        if _match:
+            log.warning(f"  {_last_ckpt_path} found (epoch {_peek.get('epoch')}, same "
+                        f"stage/arm/classes) -- AUTO-RESUMING. Delete checkpoints/ first "
+                        f"for a genuinely fresh run.")
+            args.resume = True
+        else:
+            raise SystemExit(
+                f"ABORT: {_last_ckpt_path} exists but belongs to a different run "
+                f"(stage={_peek.get('stage')!r} arm={_peek.get('arm')!r} "
+                f"classes={_peek.get('config', {}).get('num_classes')}) than this "
+                f"invocation (stage={args.stage!r} arm={args.arm!r} classes={num_classes}). "
+                f"Auto-resuming across a mismatch would load the wrong architecture. "
+                f"Pass --resume to force it, or delete checkpoints/ for a fresh run."
+            )
+        del _peek
+
     # ── Model ────────────────────────────────────────────────────────────────
     if args.resume:
         log.info("Resuming from checkpoint...")
@@ -826,6 +860,10 @@ def main():
             train_loss=train_loss,
             val_loss=val_loss,
             arcface_state=loss_fn.state_dict(),
+            # Recorded so a later run can tell whether checkpoints/last.pt is
+            # safe to auto-resume onto -- see the auto-resume guard above.
+            stage=args.stage,
+            arm=args.arm,
         )
 
         model.save_checkpoint(CKPT_DIR / "last.pt", **shared_ckpt_kwargs)
