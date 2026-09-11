@@ -142,3 +142,53 @@ def test_pk_sampler_shape_and_coverage():
         sizes.append(max(np.bincount([clusters[f"id{i:03d}"] for i in set(ids)])))
     assert len(seen) >= 8 * 60 * 0.9, "sampler never reaches most images"
     assert np.median(sizes) >= 6, f"median same-cluster identities per batch = {np.median(sizes)}, want >= 6"
+
+
+# ---------------------------------------------------------------------------
+# Eval protocol selection
+#
+# Regression test for the bug that destroyed the first A100 run. The protocol
+# was chosen by testing whether the integer label SETS were disjoint, but
+# load_folder_corpus numbers train and val independently from 0 -- so on a
+# genuinely identity-disjoint split the val labels (0..44) are a strict subset
+# of the train labels (0..230), `isdisjoint` returns False, and the evaluator
+# silently ran closed-set retrieval, scoring different animals that happened to
+# share an integer as genuine matches.
+# ---------------------------------------------------------------------------
+def test_folder_corpus_label_spaces_overlap_so_labels_cannot_pick_protocol(tmp_path):
+    """Pins the precondition that made the bug possible, so that if label
+    numbering ever changes, whoever changes it sees this explicitly."""
+    from corpus import load_folder_corpus
+    from PIL import Image
+    for i in range(15):
+        d = tmp_path / f"{i:03d}"
+        d.mkdir()
+        for j in range(4):
+            Image.new("RGB", (32, 32), (i * 7 % 256, j * 9 % 256, 0)).save(d / f"{j}.jpg")
+    train, val = load_folder_corpus(tmp_path, n_val_identities=3, seed=0, min_images=3)
+
+    assert set(train.identities).isdisjoint(set(val.identities)), \
+        "split must be identity-disjoint -- that is the whole point of it"
+    assert not set(train.labels).isdisjoint(set(val.labels)), (
+        "train and val integer labels overlap by construction; any code that "
+        "infers identity-disjointness from integer labels is therefore wrong")
+
+
+def test_evaluate_accepts_explicit_identity_disjoint_flag():
+    """The protocol must be caller-supplied, not inferred from labels."""
+    import inspect
+    from train_dinov2_arcface import evaluate
+    params = inspect.signature(evaluate).parameters
+    assert "identity_disjoint" in params, \
+        "evaluate() must take an explicit identity_disjoint flag"
+    assert params["identity_disjoint"].default is None, \
+        "flag should default to None (infer + warn), not to a silent bool"
+
+
+def test_training_passes_identity_disjoint_from_identity_strings():
+    """The call site must derive the flag from identity STRINGS, and pass it."""
+    src = (Path(__file__).parent / "train_dinov2_arcface.py").read_text(encoding="utf-8")
+    assert "split_is_identity_disjoint = set(train_corpus.identities).isdisjoint(" in src, \
+        "protocol must be decided from identity strings, where they are still in scope"
+    assert "identity_disjoint=split_is_identity_disjoint" in src, \
+        "the computed flag must actually reach evaluate()"

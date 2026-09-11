@@ -156,7 +156,8 @@ class MuzzleDataset(Dataset):
 
 
 @torch.no_grad()
-def evaluate(model, loss_fn, gallery_loader, query_loader, device):
+def evaluate(model, loss_fn, gallery_loader, query_loader, device,
+             identity_disjoint: bool | None = None):
     model.eval()
 
     gallery_embs, gallery_labels = [], []
@@ -199,9 +200,24 @@ def evaluate(model, loss_fn, gallery_loader, query_loader, device):
     # silently produce NO best checkpoint at all, start to finish.
     #
     # Detect which case this is and evaluate accordingly, rather than assume.
-    gallery_id_set = set(gallery_labels.tolist())
-    query_id_set = set(query_labels.tolist())
-    identity_disjoint = gallery_id_set.isdisjoint(query_id_set)
+    # The caller knows which case this is from the CORPORA themselves and must
+    # say so. Inferring it here from integer labels was wrong and silently
+    # destroyed a full 80-epoch A100 run: load_folder_corpus builds two
+    # INDEPENDENT label spaces (train 0..230, val 0..44), so the val labels are
+    # a strict subset of the train labels and `isdisjoint` returns False on a
+    # split whose identities are in fact completely disjoint. The closed-set
+    # branch then ran, scoring every val animal against the TRAIN gallery by
+    # integer equality -- val animal 082 and train animal 039 both carry label
+    # 7 and were counted as a genuine match. That produced top1=0.0082 (below
+    # the 1/45=0.022 chance line) and gap=-0.0007 for a checkpoint that
+    # actually scores top1=0.9429 under the correct protocol, early-stopped the
+    # run at epoch 40 on a meaningless number, and left best_top1.pt pinned to
+    # epoch 1.
+    if identity_disjoint is None:
+        identity_disjoint = set(gallery_labels.tolist()).isdisjoint(set(query_labels.tolist()))
+        log.warning("  evaluate(): identity_disjoint not supplied, inferred %s from integer "
+                    "labels -- unreliable when the corpora number their labels independently",
+                    identity_disjoint)
 
     if not identity_disjoint:
         # Original closed-set protocol, unchanged.
@@ -465,12 +481,22 @@ def main():
         train_corpus, val_corpus = load_manifest_corpus(
             MANIFEST, DATA_ROOT, require_split_hash=REQUIRED_SPLIT_HASH)
 
+    # Decided HERE, from the identity strings, because this is the only place
+    # that still has them -- evaluate() sees integer labels only, and the two
+    # corpora number their labels independently from 0, so integers cannot
+    # answer this question. Picks the retrieval protocol: open-set leave-one-out
+    # within the val set (identities disjoint) vs closed-set search against the
+    # train gallery (identities shared).
+    split_is_identity_disjoint = set(train_corpus.identities).isdisjoint(
+        set(val_corpus.identities))
+
     num_classes = train_corpus.num_classes
     log.info(f"  Arm        : {args.arm}")
     log.info(f"  Classes    : {num_classes}  (train identities)")
     log.info(f"  Train      : {len(train_corpus):,} images / {num_classes} identities")
     log.info(f"  Val        : {len(val_corpus):,} images / {val_corpus.num_classes} identities "
              f"(identity-disjoint, asserted)")
+    log.info(f"  Protocol   : {'OPEN-SET leave-one-out within val' if split_is_identity_disjoint else 'CLOSED-SET search vs train gallery'}")
 
     # Arm 2 is only meaningful if EVERY input is cropped -- train, val and the
     # gallery used for retrieval alike. A mixed arm reproduces the measured
@@ -820,7 +846,8 @@ def main():
         # ── RETRIEVAL EVAL & VAL LOSS ────────────────────────────────────────
         t_eval = time.time()
         metrics, val_loss, cached_gallery_embs, cached_gallery_labels = evaluate(
-            model, loss_fn, gallery_loader, query_loader, device
+            model, loss_fn, gallery_loader, query_loader, device,
+            identity_disjoint=split_is_identity_disjoint,
         )
         eval_s = time.time() - t_eval
 
