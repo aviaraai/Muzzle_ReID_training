@@ -315,8 +315,6 @@ def main():
                              "self-consistent (train, val and gallery all cropped)")
     parser.add_argument("--corpus-dir", default=None,
                         help="root of the folder-scanned corpus (stage=pretrain)")
-    parser.add_argument("--crop-marker", default="crop",
-                        help="substring every path must contain when --arm crop")
     parser.add_argument("--clusters", default=str(ROOT / "results" / "part3_appearance_clusters.json"))
     parser.add_argument("--val-identities", type=int, default=45)
     parser.add_argument("--seed", type=int, default=20260911)
@@ -478,17 +476,27 @@ def main():
     # gallery used for retrieval alike. A mixed arm reproduces the measured
     # -22 point collapse inside the experiment and would be indistinguishable
     # from the texture hypothesis failing.
+    #
+    # Checked via a marker file at the corpus root (written by
+    # make_arm2_crops.py), NOT a substring in the file path. A path check
+    # breaks the instant the corpus is bind-mounted somewhere else -- Docker
+    # remaps whatever host folder you point DATA_DIR at to /workspace/data,
+    # so a host folder literally named "300-crops-arm2" loses the one
+    # substring the old check looked for. A marker file survives any mount
+    # point, rename, or uv-direct invocation with no container at all.
     if args.arm == "crop":
-        bad = [p for p in list(train_corpus.paths[:50]) + list(val_corpus.paths[:50])
-               if args.crop_marker not in str(p)]
-        if bad:
+        marker = Path(args.corpus_dir or (ROOT / "data")) / "_ARM2_CROP_MARKER.json"
+        if not marker.exists():
             raise SystemExit(
-                f"ABORT: --arm crop requires every input to come from a cropped corpus "
-                f"(path must contain {args.crop_marker!r}), but e.g. {bad[0]} does not. "
-                "A mixed arm silently reproduces the -22 point cropped-vs-uncropped "
-                "collapse and would invalidate the experiment."
+                f"ABORT: --arm crop requires {marker} to exist. Its absence means this "
+                "corpus was not built by make_arm2_crops.py, or --corpus-dir points "
+                "somewhere else. A mixed cropped/uncropped arm silently reproduces the "
+                "-22 point collapse measured earlier and would invalidate the experiment. "
+                "If this corpus genuinely is all crops, create the marker: "
+                f'python -c "import json,pathlib; pathlib.Path(r\'{marker}\').write_text('
+                'json.dumps({\\"crop_frac\\": 0.60, \\"verified_manually\\": true}))"'
             )
-        log.info(f"  Arm check  : all inputs cropped (marker {args.crop_marker!r}) OK")
+        log.info(f"  Arm check  : {marker.name} present -> all inputs cropped OK")
 
     # ── Transforms ───────────────────────────────────────────────────────────
     # Augmentation policy -- each choice tied to a measurement, not a guess
