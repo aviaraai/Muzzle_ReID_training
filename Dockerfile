@@ -42,10 +42,22 @@ WORKDIR /workspace
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen
 
-# Now the actual code + dataset.
+# Code only. The dataset is NOT baked in — it is bind-mounted at run time
+# (see docker-compose.yaml). Copying it made sense when `data/` was the
+# 120MB Uttarakhand set; the 300-identity pretraining corpus is 17GB of
+# 4000x6000 JPEGs, and baking that into the image would mean a 17GB layer
+# rebuilt on every code change, pushed and pulled in full each time.
+#
+# A mount also keeps the image identical across the two training stages —
+# pretrain on the 300-corpus, fine-tune on the Uttarakhand split — with only
+# the mounted path differing, rather than two divergent images.
 COPY scripts ./scripts
 COPY main.py ./
-COPY data ./data
+
+# Mount point for the dataset. Left empty in the image; docker-compose binds
+# a host directory over it. Created here so a run with no mount fails with a
+# clear "no such file" on the manifest rather than a confusing import error.
+RUN mkdir -p /workspace/data
 
 # checkpoints/ and results/ are written at runtime, not baked into the
 # image — mount them as a volume (see docker-compose.yaml) so a training

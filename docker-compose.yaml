@@ -27,4 +27,11 @@ services:
       # replace — without this they'd be lost with the container.
       - ./checkpoints:/workspace/checkpoints
       - ./results:/workspace/results
+      # The dataset is mounted, not baked into the image. DATA_DIR points at
+      # whichever corpus this run trains on:
+      #   pretrain  -> the 300-identity corpus (17GB, 2,899 images)
+      #   fine-tune -> the Uttarakhand split   (120MB, 439 train images)
+      # Same image, same code, only the mount changes. Read-only so a
+      # training run can never mutate the corpus it is measured against.
+      - ${DATA_DIR:-./data}:/workspace/data:ro
     command: ["--gpu-preset", "auto"]
