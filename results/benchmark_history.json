@@ -1,0 +1,28 @@
+{
+  "note": "read-only instrument; scored after training, never used for selection",
+  "references": {
+    "stock DINOv2 (no fine-tuning)": 0.8619,
+    "production encoder, nocrop": 0.8381,
+    "production encoder, crop": 0.7095
+  },
+  "history": [
+    {
+      "checkpoint": "best_top1.pt",
+      "epoch": 44,
+      "top1": 0.9142857142857143,
+      "top5": 0.9619047619047619,
+      "separation": 0.3476755689826613,
+      "in_corpus_top1": 0.9481,
+      "in_corpus_gap": 0.3486
+    },
+    {
+      "checkpoint": "best_gap.pt",
+      "epoch": 59,
+      "top1": 0.9142857142857143,
+      "top5": 0.9523809523809523,
+      "separation": 0.33206509000345064,
+      "in_corpus_top1": 0.9415,
+      "in_corpus_gap": 0.3583
+    }
+  ]
+}
