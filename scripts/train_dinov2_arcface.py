@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import math
 import platform
@@ -70,7 +71,9 @@ from losses import (
 from model import GodhaarModel, build_model, _FREEZE_SCHEDULE
 from augment import build_train_transform, build_val_transform
 from corpus import (REQUIRED_SPLIT_HASH, load_clusters, load_folder_corpus,
+                    load_split_corpus,
                     load_manifest_corpus)
+from instruments import assert_disjoint_from_benchmark, score_benchmark
 from sampler import PKClusterSampler
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -157,7 +160,9 @@ class MuzzleDataset(Dataset):
 
 @torch.no_grad()
 def evaluate(model, loss_fn, gallery_loader, query_loader, device,
-             identity_disjoint: bool | None = None):
+             identity_disjoint: bool | None = None,
+             images_per_identity: int | None = None,
+             draws: int = 10, protocol_seed: int = 20260911):
     model.eval()
 
     gallery_embs, gallery_labels = [], []
@@ -249,35 +254,24 @@ def evaluate(model, loss_fn, gallery_loader, query_loader, device,
         # This is the number that actually answers "does the fine-tune
         # generalize to cattle it never saw," which is what this split was
         # built for.
-        sim_qq = query_embs @ query_embs.T  # (Q, Q)
-        n = len(query_labels)
-        ranks, gen_scores, imp_scores = [], [], []
-        for i in range(n):
-            per_id_max: dict[int, float] = {}
-            for j in range(n):
-                if j == i:
-                    continue
-                s = float(sim_qq[i, j])
-                lbl = int(query_labels[j])
-                if lbl not in per_id_max or s > per_id_max[lbl]:
-                    per_id_max[lbl] = s
-            own_id = int(query_labels[i])
-            if own_id not in per_id_max:
-                continue  # singleton identity in the query set (no other photo to compare)
-            order = sorted(per_id_max.items(), key=lambda kv: -kv[1])
-            rank = [ident for ident, _ in order].index(own_id) + 1
-            ranks.append(rank)
-            gen_scores.append(per_id_max[own_id])
-            imp_scores.append(max(s for ident, s in per_id_max.items() if ident != own_id)
-                               if len(per_id_max) > 1 else float("nan"))
+        #
+        # images_per_identity PINS how many shots each animal contributes. Left
+        # unpinned, the metric is partly a function of how many photos the field
+        # team happened to take: on identical imagery and encoder, Top-1 reads
+        # 0.6956 / 0.8304 / 0.8875 / 0.9220 / 0.9484 at 2 / 3 / 4 / 5 / all
+        # images per identity, because leave-one-out gets easier the more
+        # chances each query has to find a sibling. Pinning it at 3 is what
+        # makes this comparable to the Uttarakhand benchmark (which fixes 3 per
+        # animal) and what keeps the number off its 0.9484 ceiling.
+        from instruments import loo_rank_metrics, score_fixed_shots
 
-        ranks_arr = np.array(ranks)
-        top1 = float((ranks_arr <= 1).mean()) if len(ranks_arr) else 0.0
-        top5 = float((ranks_arr <= 5).mean()) if len(ranks_arr) else 0.0
-        gen_mean = float(np.mean(gen_scores)) if gen_scores else float("nan")
-        valid_imp = [s for s in imp_scores if not np.isnan(s)]
-        imp_mean = float(np.mean(valid_imp)) if valid_imp else float("nan")
-        gap = gen_mean - imp_mean if valid_imp else float("nan")
+        if images_per_identity:
+            m = score_fixed_shots(query_embs, query_labels,
+                                  images_per_identity, draws, protocol_seed)
+        else:
+            m = loo_rank_metrics(query_embs, query_labels)
+        top1, top5 = m["top1"], m["top5"]
+        gen_mean, imp_mean, gap = m["gen"], m["imp"], m["gap"]
 
     # val_loss still comes from the ArcFace loss on query images — informational
     # only when identity_disjoint (those classes' ArcFace weight rows never
@@ -331,6 +325,17 @@ def main():
                              "self-consistent (train, val and gallery all cropped)")
     parser.add_argument("--corpus-dir", default=None,
                         help="root of the folder-scanned corpus (stage=pretrain)")
+    parser.add_argument("--split", default=None,
+                        help="locked split manifest (split_300_v1.json). Paths inside it "
+                             "are relative and resolved against --corpus-dir. Strongly "
+                             "preferred over a live folder scan: deduplicated, "
+                             "identity-reconciled and hashed, so a run either scores the "
+                             "instrument it claims to or refuses to start")
+    parser.add_argument("--benchmark-dir", default=str(ROOT / "uk_benchmark" / "benchmark_images"),
+                        help="Uttarakhand benchmark images, used for the startup leakage "
+                             "assertion and the cross-population score")
+    parser.add_argument("--skip-benchmark", action="store_true",
+                        help="skip cross-population scoring (the leakage assertion still runs)")
     parser.add_argument("--clusters", default=str(ROOT / "results" / "part3_appearance_clusters.json"))
     parser.add_argument("--val-identities", type=int, default=45)
     parser.add_argument("--seed", type=int, default=20260911)
@@ -471,11 +476,21 @@ def main():
     # corpus; stage 2 reads the Uttarakhand manifest and refuses to start
     # unless its split_hash is the locked one. Both assert identity-disjointness
     # internally and abort rather than train on a leaky split.
+    split_meta: dict = {}
     if args.stage == "pretrain":
         corpus_dir = Path(args.corpus_dir) if args.corpus_dir else ROOT / "data"
-        log.info(f"  Stage      : PRETRAIN (folder scan)  {corpus_dir}")
-        train_corpus, val_corpus = load_folder_corpus(
-            corpus_dir, n_val_identities=args.val_identities, seed=args.seed)
+        if args.split:
+            # The locked manifest, not a live folder scan. A folder scan
+            # re-derives the split from whatever is on disk each run, so the
+            # corpus gaining or losing a file silently redefines "val" and two
+            # runs stop being comparable.
+            log.info(f"  Stage      : PRETRAIN (locked split)  {args.split}")
+            train_corpus, val_corpus, split_meta = load_split_corpus(
+                Path(args.split), corpus_dir)
+        else:
+            log.info(f"  Stage      : PRETRAIN (folder scan)  {corpus_dir}")
+            train_corpus, val_corpus = load_folder_corpus(
+                corpus_dir, n_val_identities=args.val_identities, seed=args.seed)
     else:
         log.info(f"  Stage      : FINETUNE (manifest)  {MANIFEST}")
         train_corpus, val_corpus = load_manifest_corpus(
@@ -497,6 +512,39 @@ def main():
     log.info(f"  Val        : {len(val_corpus):,} images / {val_corpus.num_classes} identities "
              f"(identity-disjoint, asserted)")
     log.info(f"  Protocol   : {'OPEN-SET leave-one-out within val' if split_is_identity_disjoint else 'CLOSED-SET search vs train gallery'}")
+
+    # ── The two instruments ──────────────────────────────────────────────────
+    # IN-CORPUS VAL measures "did it learn these animals"; CROSS-POPULATION
+    # measures "did that transfer to production's distribution". Only the first
+    # may touch training decisions -- see the benchmark call site below.
+    _proto = (split_meta.get("eval_protocol") or {}) if split_meta else {}
+    eval_ipi = _proto.get("images_per_identity")
+    eval_draws = int(_proto.get("draws", 10))
+    eval_seed = int(_proto.get("seed", args.seed))
+
+    benchmark_dir = Path(args.benchmark_dir)
+    run_benchmark = not args.skip_benchmark and benchmark_dir.is_dir()
+    if not args.skip_benchmark and not benchmark_dir.is_dir():
+        raise SystemExit(
+            f"ABORT: benchmark images not found at {benchmark_dir}. The "
+            f"cross-population instrument is how this run reports whether "
+            f"pretraining transferred; running without it silently reduces the "
+            f"experiment to an in-corpus number. Pass --skip-benchmark to "
+            f"proceed deliberately without it."
+        )
+
+    # Re-assert leakage on EVERY run. Verified once by hand (0 exact,
+    # 0 phash<=4, closest Hamming 12); a corpus regeneration, re-crop, or a
+    # folder copied into the wrong place could break it silently, and the
+    # resulting cross-population score would be inflated in the flattering
+    # direction -- the failure mode nobody catches by looking at the curve.
+    t_leak = time.time()
+    leak = assert_disjoint_from_benchmark(train_corpus.paths, benchmark_dir)
+    log.info(f"  Leakage    : {leak['exact_collisions']} exact, "
+             f"{leak['phash_collisions']} phash<=4, closest Hamming "
+             f"{leak['closest_hamming']} "
+             f"({leak['train_images']} train vs {leak['benchmark_images']} benchmark, "
+             f"{time.time()-t_leak:.0f}s)")
 
     # Arm 2 is only meaningful if EVERY input is cropped -- train, val and the
     # gallery used for retrieval alike. A mixed arm reproduces the measured
@@ -746,7 +794,44 @@ def main():
     patience = args.patience
     epochs_no_improve = 0
     best_epoch = start_epoch - 1
+    benchmark_history: list[dict] = []
     last_unfreeze_from = None
+
+    # ── Epoch 0: state both instruments and their chance lines ───────────────
+    # A score means nothing without the floor it is being read against. The
+    # first A100 run reported Top-1 0.0082 for 40 epochs and nobody noticed it
+    # was BELOW the 1/45 = 0.0222 chance line -- which is what a mis-wired
+    # metric looks like, not a model that failed to learn.
+    log.info("=" * 65)
+    log.info("  INSTRUMENT 1 -- IN-CORPUS VAL  (drives early stopping)")
+    log.info(f"    split      : {Path(args.split).name if args.split else 'live folder scan'}"
+             + (f"  hash {split_meta.get('split_hash','')[:8]}" if split_meta else ""))
+    log.info(f"    population : {val_corpus.num_classes} held-out identities / "
+             f"{len(val_corpus):,} images")
+    if eval_ipi:
+        log.info(f"    protocol   : leave-one-out, per-identity MAX, "
+                 f"{eval_ipi} images/identity x {eval_draws} seeded draws")
+    else:
+        log.info(f"    protocol   : leave-one-out, per-identity MAX, ALL images per identity "
+                 f"(WARNING: unpinned -- reads ~0.95 and has no headroom)")
+    log.info(f"    chance     : Top-1 {1.0/max(val_corpus.num_classes,1):.4f}  "
+             f"(measured on shuffled labels: 0.0194)")
+    log.info(f"    reference  : stock DINOv2 (no head) = "
+             f"{_proto.get('reference_stock_dinov2_top1', 'n/a')}")
+    log.info(f"    early stop : on {args.monitor}, patience {args.patience}")
+    log.info("")
+    log.info("  INSTRUMENT 2 -- CROSS-POPULATION BENCHMARK  (read-only)")
+    if run_benchmark:
+        log.info(f"    split      : split_v1.json  hash {REQUIRED_SPLIT_HASH[:8]}")
+        log.info(f"    population : 70 animals / 210 images (Uttarakhand)")
+        log.info(f"    protocol   : leave-one-out, per-identity MAX, 3 images/animal")
+        log.info(f"    chance     : Top-1 {1.0/70:.4f}")
+        log.info(f"    reference  : stock DINOv2 = 0.8619, production nocrop = 0.8381")
+        log.info(f"    scored at  : epochs {sorted(_PHASE_BOUNDARY_EPOCHS)} only")
+        log.info(f"    NEVER used for checkpoint selection or early stopping")
+    else:
+        log.info(f"    DISABLED (--skip-benchmark): this run reports no transfer number")
+    log.info("=" * 65)
 
     log.info("\nStarting training...\n")
 
@@ -848,6 +933,7 @@ def main():
         metrics, val_loss, cached_gallery_embs, cached_gallery_labels = evaluate(
             model, loss_fn, gallery_loader, query_loader, device,
             identity_disjoint=split_is_identity_disjoint,
+            images_per_identity=eval_ipi, draws=eval_draws, protocol_seed=eval_seed,
         )
         eval_s = time.time() - t_eval
 
@@ -904,6 +990,35 @@ def main():
             model.save_checkpoint(CKPT_DIR / f"phase_epoch{epoch:02d}.pt", **shared_ckpt_kwargs)
             log.info(f"  → freeze-phase boundary checkpoint: phase_epoch{epoch:02d}.pt")
 
+            # CROSS-POPULATION, at phase boundaries only. Deliberately computed
+            # AFTER every checkpoint-selection and early-stopping decision for
+            # this epoch has already been made from the in-corpus metrics
+            # above, and deliberately assigned to nothing those decisions read.
+            # The moment a held-out instrument can influence which weights are
+            # kept, it stops measuring transfer and starts measuring how hard
+            # the run was fitted to it -- so this is logged and recorded, and
+            # that is all it is allowed to do.
+            if run_benchmark:
+                t_bench = time.time()
+                try:
+                    b = score_benchmark(model, device, val_transform)
+                    log.info(
+                        f"  → CROSS-POPULATION (read-only, epoch {epoch}): "
+                        f"Top1={b['top1']:.4f} Top5={b['top5']:.4f} "
+                        f"sep={b['separation']:+.4f} "
+                        f"({b['n_queries']} queries / {b['n_animals']} animals, "
+                        f"chance {1.0/max(b['n_animals'],1):.4f}, "
+                        f"stock DINOv2 0.8619) [{time.time()-t_bench:.0f}s]"
+                    )
+                    benchmark_history.append(
+                        {"epoch": epoch, "top1": b["top1"], "top5": b["top5"],
+                         "separation": b["separation"]}
+                    )
+                except Exception as exc:
+                    # A benchmark failure must never take the run down -- it
+                    # informs nothing the run depends on.
+                    log.warning(f"  cross-population scoring failed at epoch {epoch}: {exc}")
+
         is_best = False
         improved_top1 = metrics["top1"] > best_top1
         improved_gap = metrics["gap"] > best_gap
@@ -938,6 +1053,19 @@ def main():
     log.info(f"  Best Top-1 : {best_top1:.4f} (Epoch {best_epoch})")
     log.info(f"  Best Gap   : {best_gap:.4f}")
     log.info(f"  Metrics    : {metrics_path}")
+    if benchmark_history:
+        # Reported separately from the in-corpus numbers above, never merged
+        # into "best", because nothing here was selected on it.
+        log.info("  CROSS-POPULATION (read-only, never used for selection):")
+        for b in benchmark_history:
+            log.info(f"    epoch {b['epoch']:>2}: Top1={b['top1']:.4f} "
+                     f"Top5={b['top5']:.4f} sep={b['separation']:+.4f}")
+        bench_path = RESULTS_DIR / "benchmark_history.json"
+        bench_path.write_text(json.dumps(
+            {"split_hash": REQUIRED_SPLIT_HASH, "note": "read-only instrument; "
+             "never used for checkpoint selection or early stopping",
+             "history": benchmark_history}, indent=2), encoding="utf-8")
+        log.info(f"    written to {bench_path}")
     log.info(f"  Checkpoints: {CKPT_DIR}")
     log.info("=" * 65)
     # NOTE: the reference number to compare this against is NOT hardcoded

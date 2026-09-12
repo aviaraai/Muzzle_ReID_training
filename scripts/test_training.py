@@ -192,3 +192,95 @@ def test_training_passes_identity_disjoint_from_identity_strings():
         "protocol must be decided from identity strings, where they are still in scope"
     assert "identity_disjoint=split_is_identity_disjoint" in src, \
         "the computed flag must actually reach evaluate()"
+
+
+# ---------------------------------------------------------------------------
+# The two instruments
+#
+# In-corpus val drives early stopping; the cross-population benchmark is
+# read-only. These pin the properties that make the second one meaningful --
+# if the benchmark ever reaches a checkpoint-selection or early-stopping
+# decision, it stops measuring transfer and starts measuring how hard the run
+# was fitted to it, and no later number from it can be trusted.
+# ---------------------------------------------------------------------------
+def test_images_per_identity_changes_the_score_monotonically():
+    """The pinned protocol exists because this variable dominates the metric."""
+    from instruments import score_fixed_shots
+    # Noise/dim chosen so the task is genuinely hard (Top-1 ~0.44 at k=2). At
+    # low noise every setting scores 1.000 and the test proves nothing.
+    rng = np.random.default_rng(0)
+    n_ids, per_id, dim = 30, 6, 16
+    centres = rng.normal(size=(n_ids, dim))
+    embs, labels = [], []
+    for i in range(n_ids):
+        v = centres[i] + 1.0 * rng.normal(size=(per_id, dim))
+        embs.append(v / np.linalg.norm(v, axis=1, keepdims=True))
+        labels.extend([i] * per_id)
+    embs = np.vstack(embs).astype(np.float32)
+    labels = np.array(labels)
+
+    scores = [score_fixed_shots(embs, labels, k, draws=5, seed=1)["top1"]
+              for k in (2, 3, 4, 5)]
+    assert scores == sorted(scores), (
+        f"Top-1 must not fall as shots per identity rise; got {scores}")
+    assert scores[-1] > scores[0], "more shots per identity must make LOO easier"
+
+
+def test_benchmark_is_never_used_for_selection_or_early_stopping():
+    """Static proof: the benchmark's result must not reach any decision var."""
+    src = (Path(__file__).parent / "train_dinov2_arcface.py").read_text(encoding="utf-8")
+    # Scope strictly to the benchmark block: from the call to the end of its
+    # own except clause. A wider window would sweep in later, unrelated code
+    # that legitimately mentions best_top1 and make this pass or fail for the
+    # wrong reason.
+    body = src[src.index("if run_benchmark:"):]
+    start = body.index("score_benchmark(")
+    end = body.index("cross-population scoring failed")
+    window = body[start:end]
+    for forbidden in ("best_top1", "best_gap", "epochs_no_improve", "is_best",
+                      "save_checkpoint", "metrics["):
+        assert forbidden not in window, (
+            f"cross-population scoring must not touch {forbidden!r} -- a read-only "
+            f"instrument that influences training measures nothing")
+    assert "benchmark_history.append" in window, "the score must still be recorded"
+
+
+def test_benchmark_scored_only_at_phase_boundaries():
+    from train_dinov2_arcface import _PHASE_BOUNDARY_EPOCHS
+    assert _PHASE_BOUNDARY_EPOCHS == {5, 20, 45, 80}, (
+        f"benchmark epochs are the freeze-phase boundaries; got {_PHASE_BOUNDARY_EPOCHS}")
+
+
+def test_leakage_assertion_catches_an_exact_and_a_near_duplicate(tmp_path):
+    """It must fail on both byte-identical and merely re-encoded overlap."""
+    from instruments import assert_disjoint_from_benchmark
+    from PIL import Image
+    bench = tmp_path / "bench"; bench.mkdir()
+    train = tmp_path / "train"; train.mkdir()
+    rng = np.random.default_rng(3)
+    shared = Image.fromarray(rng.integers(0, 255, (64, 64, 3), dtype=np.uint8))
+    shared.save(bench / "b0.jpg", quality=95)
+    for i in range(3):
+        a = Image.fromarray(rng.integers(0, 255, (64, 64, 3), dtype=np.uint8))
+        a.save(train / f"t{i}.jpg", quality=95)
+    # clean -> passes
+    ok = assert_disjoint_from_benchmark(sorted(train.glob("*.jpg")), bench)
+    assert ok["exact_collisions"] == 0 and ok["phash_collisions"] == 0
+
+    # exact copy -> must abort
+    import shutil
+    shutil.copy(bench / "b0.jpg", train / "leak.jpg")
+    with pytest.raises(SystemExit, match="overlaps the benchmark"):
+        assert_disjoint_from_benchmark(sorted(train.glob("*.jpg")), bench)
+
+    # re-encoded copy (different sha256, same photograph) -> must still abort
+    (train / "leak.jpg").unlink()
+    Image.open(bench / "b0.jpg").save(train / "reenc.jpg", quality=60)
+    assert _sha(train / "reenc.jpg") != _sha(bench / "b0.jpg"), "test setup: sha must differ"
+    with pytest.raises(SystemExit, match="overlaps the benchmark"):
+        assert_disjoint_from_benchmark(sorted(train.glob("*.jpg")), bench)
+
+
+def _sha(p):
+    import hashlib
+    return hashlib.sha256(p.read_bytes()).hexdigest()

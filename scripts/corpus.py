@@ -158,3 +158,74 @@ def load_clusters(path: Path, identities: set[str]) -> dict[str, int]:
     for n, i in enumerate(sorted(missing)):
         out[i] = 10_000 + n
     return {i: out[i] for i in identities}
+
+
+REQUIRED_SPLIT_300_HASH = "2cffb3787eae89e1b57d21a82d7808d9a0d76c380ad8e9005e121bc779f851ef"
+
+
+def load_split_corpus(split_path: Path, corpus_dir: Path,
+                      require_hash: str | None = REQUIRED_SPLIT_300_HASH
+                      ) -> tuple[Corpus, Corpus, dict]:
+    """The 300-corpus as a LOCKED split manifest, not a live folder scan.
+
+    load_folder_corpus() re-derives the split from whatever happens to be on
+    disk every run, so a corpus that gains, loses or re-crops a file silently
+    changes what "val" means and two runs stop being comparable. This reads a
+    fixed manifest instead: deduplicated, identity-reconciled, identity-disjoint,
+    and hashed, so a run either scores the instrument it claims to or refuses to
+    start.
+
+    Paths in the manifest are RELATIVE and resolved against `corpus_dir`, so the
+    same file works on the machine that built it and the server that trains on
+    it. Every image's sha256 is verified -- a silently re-encoded or replaced
+    crop is caught here rather than quietly shifting a number later.
+
+    Returns (train, val, split_dict); the caller needs the dict for
+    `eval_protocol`.
+    """
+    split_path, corpus_dir = Path(split_path), Path(corpus_dir)
+    if not split_path.exists():
+        raise SystemExit(f"ABORT: split manifest not found: {split_path}")
+    split = json.loads(split_path.read_text(encoding="utf-8"))
+
+    if require_hash and split.get("split_hash") != require_hash:
+        raise SystemExit(
+            f"ABORT: {split_path.name} has split_hash {split.get('split_hash')!r}, "
+            f"expected {require_hash!r}. A different split is a different "
+            f"instrument and its numbers are not comparable to any recorded "
+            f"baseline. Refusing to train."
+        )
+
+    import hashlib
+
+    def build(section: str) -> tuple[Corpus, list[str]]:
+        ids = sorted(split[section])
+        lm = {i: n for n, i in enumerate(ids)}
+        paths, idents, bad = [], [], []
+        for i in ids:
+            for e in split[section][i]:
+                p = corpus_dir / e["rel"]
+                if not p.exists():
+                    bad.append(f"missing {e['rel']}")
+                    continue
+                h = hashlib.sha256()
+                with open(p, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                if h.hexdigest() != e["sha256"]:
+                    bad.append(f"sha256 mismatch {e['rel']}")
+                    continue
+                paths.append(p)
+                idents.append(i)
+        if bad:
+            raise SystemExit(
+                f"ABORT: {len(bad)} image(s) in split section {section!r} are missing or "
+                f"altered under {corpus_dir} (e.g. {bad[:3]}). The split describes an "
+                f"instrument that is no longer on disk; any score would be meaningless."
+            )
+        return Corpus(paths, idents, lm), ids
+
+    train, _ = build("train")
+    val, _ = build("val")
+    _assert_disjoint(train, val)
+    return train, val, split
