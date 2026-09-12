@@ -198,6 +198,10 @@ def load_split_corpus(split_path: Path, corpus_dir: Path,
 
     import hashlib
 
+    # Both sections are checked BEFORE anything aborts. Raising inside the
+    # train pass meant val was never examined, so a corpus with damage in both
+    # halves surfaced one file per run -- fix, re-copy, re-run, discover the
+    # next one. Whoever is repairing a transfer needs the whole list at once.
     def build(section: str) -> tuple[Corpus, list[str]]:
         ids = sorted(split[section])
         lm = {i: n for n, i in enumerate(ids)}
@@ -206,26 +210,33 @@ def load_split_corpus(split_path: Path, corpus_dir: Path,
             for e in split[section][i]:
                 p = corpus_dir / e["rel"]
                 if not p.exists():
-                    bad.append(f"missing {e['rel']}")
+                    bad.append(f"{section}/{e['rel']}: missing")
                     continue
                 h = hashlib.sha256()
                 with open(p, "rb") as f:
                     for chunk in iter(lambda: f.read(1 << 20), b""):
                         h.update(chunk)
                 if h.hexdigest() != e["sha256"]:
-                    bad.append(f"sha256 mismatch {e['rel']}")
+                    bad.append(f"{section}/{e['rel']}: sha256 mismatch "
+                               f"({p.stat().st_size} bytes on disk)")
                     continue
                 paths.append(p)
                 idents.append(i)
-        if bad:
-            raise SystemExit(
-                f"ABORT: {len(bad)} image(s) in split section {section!r} are missing or "
-                f"altered under {corpus_dir} (e.g. {bad[:3]}). The split describes an "
-                f"instrument that is no longer on disk; any score would be meaningless."
-            )
-        return Corpus(paths, idents, lm), ids
+        return Corpus(paths, idents, lm), bad
 
-    train, _ = build("train")
-    val, _ = build("val")
+    train, bad_train = build("train")
+    val, bad_val = build("val")
+    bad = bad_train + bad_val
+    if bad:
+        listed = "\n  ".join(bad[:20])
+        more = f"\n  ... and {len(bad) - 20} more" if len(bad) > 20 else ""
+        raise SystemExit(
+            f"ABORT: {len(bad)} of {len(train) + len(val) + len(bad)} image(s) are missing "
+            f"or altered under {corpus_dir}:\n  {listed}{more}\n"
+            f"The split describes an instrument that is no longer on disk, so any score "
+            f"would be meaningless. Re-copy the listed file(s) from the source corpus -- "
+            f"a mismatch is almost always a truncated or interrupted transfer, not a bad "
+            f"split. Run scripts/verify_corpus.py for the full report without starting a run."
+        )
     _assert_disjoint(train, val)
     return train, val, split
