@@ -284,3 +284,30 @@ def test_leakage_assertion_catches_an_exact_and_a_near_duplicate(tmp_path):
 def _sha(p):
     import hashlib
     return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def test_vendored_benchmark_resolves_its_own_images_and_refuses_to_fall_back():
+    """The vendored harness sits one level shallower than the original.
+
+    parent.parent pointed _PROTECTED_DIR at a directory that does not exist, so
+    _resolve() fell back to the manifest's ABSOLUTE source path -- which exists
+    only on the machine that built the split. The instrument therefore worked
+    locally and failed on the training server, silently, for a whole 80-epoch
+    run. Both halves are pinned: the directory must resolve, and the fallback
+    must be gone.
+    """
+    import sys
+    root = Path(__file__).resolve().parent.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from uk_benchmark import benchmark as B
+
+    assert B._REPO.name == "uk_benchmark", (
+        f"_REPO must be the uk_benchmark dir itself, got {B._REPO}")
+    assert B._DEFAULT_SPLIT.exists(), f"split manifest missing: {B._DEFAULT_SPLIT}"
+
+    src = (root / "uk_benchmark" / "benchmark.py").read_text(encoding="utf-8")
+    assert "return protected if protected.exists() else Path(entry[" not in src, (
+        "the silent absolute-path fallback must stay removed -- it is what hid "
+        "a missing benchmark_images/ through a full training run")
+    assert "raise FileNotFoundError" in src, "a missing image must fail loudly"

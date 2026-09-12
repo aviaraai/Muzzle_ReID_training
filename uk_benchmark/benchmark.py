@@ -64,7 +64,13 @@ import numpy as np
 
 __all__ = ["evaluate", "load_split"]
 
-_REPO = Path(__file__).resolve().parent.parent
+# VENDORED COPY: this file sits at <repo>/uk_benchmark/benchmark.py, one level
+# shallower than the original at inference_server/eval/benchmark.py. parent.parent
+# pointed at the repo root here, so _PROTECTED_DIR named a directory that does not
+# exist, _resolve() fell back to the manifest's absolute source path, and the
+# instrument silently worked on the machine that built the split and failed on
+# every other one. parent is correct for THIS location.
+_REPO = Path(__file__).resolve().parent
 _DEFAULT_SPLIT = _REPO / "splits" / "split_v1.json"
 _RESULTS_DIR = _REPO / "results"
 _PROTECTED_DIR = _REPO / "benchmark_images"
@@ -85,7 +91,19 @@ def _resolve(entry: dict, canonical_id: str) -> Path:
     sha256 below, so a silently-edited file is caught rather than scored.
     """
     protected = _PROTECTED_DIR / canonical_id / Path(entry["path"]).name
-    return protected if protected.exists() else Path(entry["path"])
+    if protected.exists():
+        return protected
+    # No silent fallback to entry["path"]. That path is absolute and points into
+    # the corpus of the machine that BUILT the split, so falling back to it makes
+    # the instrument appear to work there and fail everywhere else -- which is
+    # exactly how a missing benchmark_images/ went unnoticed through a full
+    # 80-epoch run. Fail loudly instead.
+    raise FileNotFoundError(
+        f"benchmark image not found: {protected}. The vendored benchmark_images/ "
+        f"directory is missing or incomplete -- it is gitignored and must be copied "
+        f"alongside the code. Refusing to fall back to the manifest's absolute path, "
+        f"which only resolves on the machine the split was built on."
+    )
 
 
 def _load_benchmark_images(split: dict) -> tuple[list[bytes], list[str], list[str]]:
