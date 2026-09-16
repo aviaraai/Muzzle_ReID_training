@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -44,7 +45,11 @@ from config import IMG_SIZE               # noqa: E402
 from model import GodhaarModel            # noqa: E402
 from uk_benchmark.benchmark import evaluate as bench_evaluate  # noqa: E402
 
-POSE_W = r"D:\Group Projects\inference_server\appstorage\Models\pose_model\best.pt"
+# Overridable so this runs somewhere other than the machine it was written on.
+POSE_W = os.environ.get(
+    "POSE_MODEL_PATH",
+    r"D:\Group Projects\inference_server\appstorage\Models\pose_model\best.pt",
+)
 CROP_FRAC, KCONF, MUZZLE = 0.60, 0.25, 7
 GRID = [None, 448, 384, 320, 256, 224, 160, 112, 80, 56, 28, 14]
 MM_PER_PX_AT_518 = 0.232          # crop domain (full frame is 0.70)

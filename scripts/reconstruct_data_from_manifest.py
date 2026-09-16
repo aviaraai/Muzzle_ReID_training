@@ -4,8 +4,8 @@ manifest CSV (no image bytes need to be re-transferred if you already have
 a copy of the source images on this machine).
 
 Verifies every file it copies against the manifest's own sha256 column, so
-a friend's copy of Godhaar_aron that differs even slightly from the one the
-manifest was built against (re-compressed, partially re-synced, wrong
+another machine's copy of Godhaar_aron that differs even slightly from the one
+the manifest was built against (re-compressed, partially re-synced, wrong
 version) is caught explicitly -- not silently used as if it were identical.
 The quality/crop-gate decisions that produced this manifest were made
 against SPECIFIC bytes; a different-but-similar-looking file is not the

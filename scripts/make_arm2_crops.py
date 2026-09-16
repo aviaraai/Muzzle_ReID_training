@@ -11,18 +11,29 @@ Images with no muzzle keypoint are dropped (8% of this corpus); with a median
 of 10 images per identity that costs depth, not identities.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-sys.path.insert(0, r"D:\Group Projects\inference_server")
+# Paths to the sibling inference_server checkout and the raw corpus. Overridable
+# so this runs somewhere other than the machine it was written on.
+INFERENCE_SERVER = os.environ.get(
+    "INFERENCE_SERVER_DIR", r"D:\Group Projects\inference_server"
+)
+sys.path.insert(0, INFERENCE_SERVER)
 from ultralytics import YOLO
 
-CORP = Path(r"D:\Group Projects\godhaar-all-images\300-Cattle-source")
-OUT = Path(r"D:\Group Projects\godhaar-all-images\300-crops-arm2")
-POSE_W = r"D:\Group Projects\inference_server\appstorage\Models\pose_model\best.pt"
+CORP = Path(os.environ.get(
+    "CORPUS_DIR", r"D:\Group Projects\godhaar-all-images\300-Cattle-source"))
+OUT = Path(os.environ.get(
+    "ARM2_OUT_DIR", r"D:\Group Projects\godhaar-all-images\300-crops-arm2"))
+POSE_W = os.environ.get(
+    "POSE_MODEL_PATH",
+    str(Path(INFERENCE_SERVER) / "appstorage" / "Models" / "pose_model" / "best.pt"),
+)
 CROP_FRAC, KCONF, SAVE_PX, MUZZLE = 0.60, 0.25, 1024, 7
 
 OUT.mkdir(exist_ok=True)
